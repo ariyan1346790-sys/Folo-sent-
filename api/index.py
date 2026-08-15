@@ -11,28 +11,21 @@ from Crypto.Util.Padding import pad
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Dynamic Multi-Path Importer for follow_pb2
+# Dynamic Multi-Path Protobuf Importer
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, CURRENT_DIR)
 sys.path.insert(0, os.path.join(CURRENT_DIR, '..'))
-sys.path.insert(0, os.path.join(CURRENT_DIR, '..', 'Pb2'))
 sys.path.insert(0, os.path.join(CURRENT_DIR, 'Pb2'))
+sys.path.insert(0, os.path.join(CURRENT_DIR, '..', 'Pb2'))
 
-follow_pb2 = None
 try:
     import follow_pb2
-    from google.protobuf.json_format import MessageToDict
-except Exception:
-    try:
-        from . import follow_pb2
-        from google.protobuf.json_format import MessageToDict
-    except Exception:
-        follow_pb2 = None
+except ImportError:
+    follow_pb2 = None
 
 STATIC_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 STATIC_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
 
-# High-Capacity Reusable Session Connection Pool
 SESSION = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
 SESSION.mount('https://', adapter)
@@ -41,85 +34,24 @@ def encrypt_proto(payload_bytes: bytes) -> bytes:
     cipher = AES.new(STATIC_KEY, AES.MODE_CBC, STATIC_IV)
     return cipher.encrypt(pad(payload_bytes, AES.block_size))
 
-def encode_varint(n: int) -> bytes:
-    buf = bytearray()
-    while n > 127:
-        buf.append((n & 0x7F) | 0x80)
-        n >>= 7
-    buf.append(n & 0x7F)
-    return bytes(buf)
-
-def build_follow_payload(target_id: int) -> bytes:
-    if follow_pb2 is not None:
-        try:
-            req = follow_pb2.CSFollowReq()
-            req.target_id = int(target_id)
-            return encrypt_proto(req.SerializeToString())
-        except Exception:
-            pass
-    raw_proto = b'\x08' + encode_varint(int(target_id))
-    return encrypt_proto(raw_proto)
-
-def analyze_follow_result(content: bytes):
+def send_follow_request(target_id, jwt_token):
     """
-    নিখুঁতভাবে যাচাই করবে ফলো আসলেই গেছে নাকি ম্যাচ বাকি বা ফেইল্ড
+    spin.py এর মতো BD এবং IND উভয় সার্ভারে ফলো পাঠানোর ট্রাই করবে
     """
-    if follow_pb2 is not None:
-        try:
-            proto_res = follow_pb2.CSFollowRes()
-            proto_res.ParseFromString(content)
-            fail_txt = str(proto_res.fail_info).lower() if proto_res.fail_info else ""
-
-            # ১. অলরেডি ফলো দেওয়া থাকলে
-            if "already" in fail_txt or "followed" in fail_txt:
-                return "ALREADY_FOLLOWED", "Already Followed (অলরেডি ছিল)", True, 0
-
-            # ২. ৩টি ম্যাচ খেলা না থাকলে
-            if getattr(proto_res, 'remaining_play_count', 0) > 0:
-                rem = proto_res.remaining_play_count
-                return "NEED_MATCHES", f"Need 3 Maps Play ({rem} remaining)", False, rem
-
-            # ৩. ফলো লিমিট শেষ হলে
-            if hasattr(proto_res, 'remaining_follow_capacity') and proto_res.remaining_follow_capacity == 0:
-                return "NO_CAPACITY", "Daily Follow Capacity Reached", False, 0
-
-            # ৪. কোনো ফেইল ইনফো থাকলে
-            if proto_res.fail_info:
-                return "FAILED", f"Failed: {proto_res.fail_info}", False, 0
-
-            # ৫. নিশ্চিত ট্রু সাকসেস
-            return "SUCCESS", "Follow Sent Successfully", True, 0
-
-        except Exception:
-            pass
-
-    # Fallback RAW scanner
-    txt = content.decode('utf-8', errors='ignore').lower()
-    if "already" in txt or "followed" in txt:
-        return "ALREADY_FOLLOWED", "Already Followed (অলরেডি ছিল)", True, 0
-    
-    # যদি কন্টেন্ট ছোট বা খালি থাকে তবে এটি ফেইল্ড (ফেক সাকসেস বন্ধ করতে)
-    if len(content) < 2:
-        return "FAILED", "Invalid server response", False, 0
-
-    return "SUCCESS", "Follow Sent Successfully", True, 0
-
-def execute_single_follow(target_id: str, jwt_token: str, account_uid: str = ""):
     urls = [
         "https://clientbp.ggpolarbear.com/Follow",        # BD Server
         "https://client.ind.freefiremobile.com/Follow"     # IND Server
     ]
 
+    if follow_pb2 is None:
+        return False, None, "follow_pb2 module missing on server"
+
     try:
-        encrypted_data = build_follow_payload(int(target_id))
+        req = follow_pb2.CSFollowReq()
+        req.target_id = int(target_id)
+        encrypted_data = encrypt_proto(req.SerializeToString())
     except Exception as e:
-        return {
-            "uid": account_uid,
-            "status": "failed",
-            "result_type": "FAILED",
-            "message": f"Encryption error: {str(e)}",
-            "should_save": False
-        }
+        return False, None, f"Protobuf encryption error: {str(e)}"
 
     headers = {
         "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
@@ -129,39 +61,89 @@ def execute_single_follow(target_id: str, jwt_token: str, account_uid: str = "")
         "X-Ga": "v1 1",
         "Releaseversion": "OB54",
         "Content-Type": "application/x-www-form-urlencoded",
+        "X-Unity-Version": "2022.3.47f1",
         "Connection": "keep-alive"
     }
 
     for url in urls:
         try:
-            res = SESSION.post(url, headers=headers, data=encrypted_data, verify=False, timeout=6)
+            res = SESSION.post(url, headers=headers, data=encrypted_data, verify=False, timeout=8)
             if res.status_code == 200:
-                res_type, msg, should_save, rem_maps = analyze_follow_result(res.content)
-                return {
-                    "uid": account_uid,
-                    "status": res_type.lower(),
-                    "result_type": res_type,
-                    "remaining": rem_maps,
-                    "message": msg,
-                    "should_save": should_save
-                }
+                proto_res = follow_pb2.CSFollowRes()
+                proto_res.ParseFromString(res.content)
+                return True, proto_res, ""
             elif res.status_code == 401:
-                return {
-                    "uid": account_uid,
-                    "status": "token_expired",
-                    "result_type": "TOKEN_EXPIRED",
-                    "message": "Token Expired (401)",
-                    "should_save": False
-                }
+                return False, None, "Token Expired (401)"
         except Exception:
             continue
 
+    return False, None, "HTTP Server Error or Timeout"
+
+def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
+    """
+    spin.py এর হুবহু লজিক অনুযায়ী রেজাল্ট জাজ করবে
+    """
+    ok, proto_res, err_msg = send_follow_request(target_id, jwt_token)
+    if not ok:
+        res_type = "TOKEN_EXPIRED" if "401" in err_msg else "FAILED"
+        return {
+            "uid": uid,
+            "status": "failed",
+            "result_type": res_type,
+            "message": f"Server Error: {err_msg}",
+            "should_save": False
+        }
+
+    fail_txt = str(proto_res.fail_info).lower() if proto_res.fail_info else ""
+
+    # Check 1: Already Followed (✅ Saved)
+    if "already" in fail_txt or "followed" in fail_txt:
+        return {
+            "uid": uid,
+            "status": "already_followed",
+            "result_type": "ALREADY_FOLLOWED",
+            "message": "Already Followed (অলরেডি দেওয়া হয়ে গেছে)",
+            "should_save": True
+        }
+
+    # Check 2: Fail Info from server (❌ NOT Saved - কোনো এরর থাকলে কখনোই সাকসেস হবে না)
+    if proto_res.fail_info:
+        return {
+            "uid": uid,
+            "status": "failed",
+            "result_type": "FAILED",
+            "message": f"Failed: {proto_res.fail_info}",
+            "should_save": False
+        }
+
+    # Check 3: MUST HAVE PLAYED 3 MAP MATCHES! (❌ NOT Saved)
+    if proto_res.remaining_play_count > 0:
+        return {
+            "uid": uid,
+            "status": "need_matches",
+            "result_type": "NEED_MATCHES",
+            "remaining": proto_res.remaining_play_count,
+            "message": f"Need 3 Maps Play ({proto_res.remaining_play_count} match remaining)",
+            "should_save": False
+        }
+
+    # Check 4: Capacity Check (❌ NOT Saved)
+    if hasattr(proto_res, 'remaining_follow_capacity') and proto_res.remaining_follow_capacity == 0:
+        return {
+            "uid": uid,
+            "status": "no_capacity",
+            "result_type": "NO_CAPACITY",
+            "message": "Daily Capacity Reached (ক্যাপাসিটি শেষ)",
+            "should_save": False
+        }
+
+    # TRULY SUCCESSFUL FOLLOW (✅ Saved)
     return {
-        "uid": account_uid,
-        "status": "failed",
-        "result_type": "FAILED",
-        "message": "Network/Server Timeout",
-        "should_save": False
+        "uid": uid,
+        "status": "success",
+        "result_type": "SUCCESS",
+        "message": "Follow Sent Successfully (সত্যি সত্যি ফলো গেছে)",
+        "should_save": True
     }
 
 class handler(BaseHTTPRequestHandler):
@@ -182,7 +164,7 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        self._send_json(200, {"status": "online", "service": "Garena Turbo Follow Engine v7.0 (Strict Accurate Mode)"})
+        self._send_json(200, {"status": "online", "service": "Garena Accurate Follow Engine v8.0"})
 
     def do_POST(self):
         try:
@@ -192,13 +174,13 @@ class handler(BaseHTTPRequestHandler):
 
             target_id = str(data.get('target_id', '')).strip()
             if not target_id:
-                self._send_json(400, {"status": "failed", "message": "Target UID required."})
+                self._send_json(400, {"status": "failed", "message": "Target UID is required."})
                 return
 
-            # Batch Execution Mode
+            # Batch Follow Mode
             if "tokens" in data and isinstance(data["tokens"], list):
                 tokens_list = data["tokens"]
-                
+
                 def worker(item):
                     if isinstance(item, dict):
                         tok = item.get("token", "")
@@ -206,9 +188,9 @@ class handler(BaseHTTPRequestHandler):
                     else:
                         tok = str(item)
                         acc_uid = ""
-                    return execute_single_follow(target_id, tok, acc_uid)
+                    return process_single_follow(target_id, tok, acc_uid)
 
-                workers_count = min(70, max(10, len(tokens_list)))
+                workers_count = min(60, max(10, len(tokens_list)))
                 with ThreadPoolExecutor(max_workers=workers_count) as executor:
                     results = list(executor.map(worker, tokens_list))
 
@@ -242,15 +224,14 @@ class handler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # Single Execution Mode
+            # Single Follow Mode
             jwt_token = str(data.get('token', '')).strip()
             account_uid = str(data.get('uid', '')).strip()
-
             if not jwt_token:
                 self._send_json(400, {"status": "failed", "message": "Token is required."})
                 return
 
-            result = execute_single_follow(target_id, jwt_token, account_uid)
+            result = process_single_follow(target_id, jwt_token, account_uid)
             self._send_json(200, result)
 
         except Exception as e:
