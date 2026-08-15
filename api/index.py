@@ -3,6 +3,7 @@ import sys
 import json
 import urllib3
 import requests
+import traceback
 import importlib.util
 from http.server import BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
@@ -13,53 +14,55 @@ from Crypto.Util.Padding import pad
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==============================================================================
-#      🔍 UNIVERSAL DEEP SCANNER (যে ফোল্ডারেই থাকুক খুঁজে লোড করবে)
+#      🔍 ALL-CASE INSENSITIVE SMART LOADER (নাম যেভাবেই থাক লোড করবে)
 # ==============================================================================
 follow_pb2 = None
+LOAD_ERROR = None
+ALL_FOUND_FILES = []
 
-def find_and_load_follow_pb2():
-    global follow_pb2
-    # ১. সরাসরি সাধারণ ইমপোর্ট ট্রাই
-    try:
-        import follow_pb2 as pb
-        follow_pb2 = pb
-        return
-    except Exception:
-        pass
+def smart_load_follow_pb2():
+    global follow_pb2, LOAD_ERROR, ALL_FOUND_FILES
+    
+    # ১. সাধারণ নাম ট্রাই
+    possible_module_names = ["follow_pb2", "Follow_pb2", "follow_Pb2", "FOLLOW_PB2"]
+    for mod_name in possible_module_names:
+        try:
+            follow_pb2 = __import__(mod_name)
+            return
+        except Exception:
+            pass
 
-    # ২. বর্তমান ডিরেক্টরি এবং তার ওপরের/ভেতরের সব সাব-ফোল্ডার স্ক্যান
-    base_dirs = [
+    # ২. লিনাক্স সার্ভারের সমস্ত ফোল্ডার স্ক্যান (Case-Insensitive)
+    scan_roots = [
         os.path.dirname(os.path.abspath(__file__)),
         os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')),
         os.getcwd(),
-        "/var/task"  # Vercel AWS Lambda Root
+        "/var/task"
     ]
 
-    scanned_paths = set()
-    for b_dir in base_dirs:
-        if not os.path.exists(b_dir):
+    for root_dir in scan_roots:
+        if not os.path.exists(root_dir):
             continue
-        for root, dirs, files in os.walk(b_dir):
-            if root in scanned_paths:
-                continue
-            scanned_paths.add(root)
-            if root not in sys.path:
-                sys.path.insert(0, root)
-
-            for f in files:
-                if f.lower() == "follow_pb2.py" or (f.lower().endswith(".py") and "follow_pb2" in f.lower()):
-                    full_file_path = os.path.join(root, f)
+        for r, d, f_list in os.walk(root_dir):
+            for file in f_list:
+                full_path = os.path.join(r, file)
+                ALL_FOUND_FILES.append(full_path)
+                
+                # যদি ফাইলের নামের ভেতর 'follow' এবং 'pb2' থাকে (যেকোনো ছোট/বড় হাতের অক্ষরে)
+                f_lower = file.lower()
+                if "follow" in f_lower and "pb2" in f_lower and f_lower.endswith(".py"):
                     try:
-                        spec = importlib.util.spec_from_file_location("follow_pb2", full_file_path)
+                        spec = importlib.util.spec_from_file_location("follow_pb2", full_path)
                         mod = importlib.util.module_from_spec(spec)
+                        sys.modules["follow_pb2"] = mod
                         spec.loader.exec_module(mod)
                         if hasattr(mod, 'CSFollowReq') and hasattr(mod, 'CSFollowRes'):
                             follow_pb2 = mod
                             return
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        LOAD_ERROR = f"Path {full_path} load error: {traceback.format_exc()}"
 
-find_and_load_follow_pb2()
+smart_load_follow_pb2()
 
 # ==============================================================================
 #                       OFFICIAL GARENA CRYPTO & KEYS
@@ -67,7 +70,6 @@ find_and_load_follow_pb2()
 STATIC_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 STATIC_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
 
-# High-Capacity Reusable Session Connection Pool
 SESSION = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
 SESSION.mount('https://', adapter)
@@ -76,20 +78,17 @@ def encrypt_proto(payload_bytes: bytes) -> bytes:
     cipher = AES.new(STATIC_KEY, AES.MODE_CBC, STATIC_IV)
     return cipher.encrypt(pad(payload_bytes, AES.block_size))
 
-# ==============================================================================
-#                   FOLLOW REQUEST RUNNER (BD + IND SERVERS)
-# ==============================================================================
 def send_follow_request(target_id, jwt_token):
     global follow_pb2
     if follow_pb2 is None:
-        find_and_load_follow_pb2()
+        smart_load_follow_pb2()
 
     if follow_pb2 is None:
-        return False, None, "follow_pb2 file could not be loaded anywhere on server"
+        return False, None, f"follow_pb2 missing. Found files: {ALL_FOUND_FILES[:10]}"
 
     urls = [
-        "https://clientbp.ggpolarbear.com/Follow",        # BD Server
-        "https://client.ind.freefiremobile.com/Follow"     # IND Server
+        "https://clientbp.ggpolarbear.com/Follow",
+        "https://client.ind.freefiremobile.com/Follow"
     ]
 
     try:
@@ -125,9 +124,6 @@ def send_follow_request(target_id, jwt_token):
 
     return False, None, "HTTP Server Error or Timeout"
 
-# ==============================================================================
-#                     SPIN.PY EXACT RESPONSE JUDGEMENT
-# ==============================================================================
 def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
     ok, proto_res, err_msg = send_follow_request(target_id, jwt_token)
     if not ok:
@@ -142,7 +138,7 @@ def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
 
     fail_txt = str(proto_res.fail_info).lower() if proto_res.fail_info else ""
 
-    # Check 1: Already Followed (✅ Saved)
+    # 1. Already Followed
     if "already" in fail_txt or "followed" in fail_txt:
         return {
             "uid": uid,
@@ -152,7 +148,7 @@ def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
             "should_save": True
         }
 
-    # Check 2: Fail Info from server (❌ NOT Saved)
+    # 2. Server Fail Info (Limit / Error)
     if proto_res.fail_info:
         return {
             "uid": uid,
@@ -162,7 +158,7 @@ def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
             "should_save": False
         }
 
-    # Check 3: MUST HAVE PLAYED 3 MAP MATCHES! (❌ NOT Saved)
+    # 3. 3 Maps Play Needed
     if proto_res.remaining_play_count > 0:
         return {
             "uid": uid,
@@ -173,7 +169,7 @@ def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
             "should_save": False
         }
 
-    # Check 4: Capacity Check (❌ NOT Saved)
+    # 4. Capacity Full
     if hasattr(proto_res, 'remaining_follow_capacity') and proto_res.remaining_follow_capacity == 0:
         return {
             "uid": uid,
@@ -183,7 +179,7 @@ def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
             "should_save": False
         }
 
-    # TRULY SUCCESSFUL FOLLOW (✅ Saved)
+    # 5. Success
     return {
         "uid": uid,
         "status": "success",
@@ -192,9 +188,6 @@ def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
         "should_save": True
     }
 
-# ==============================================================================
-#                            SERVERLESS HANDLER
-# ==============================================================================
 class handler(BaseHTTPRequestHandler):
     def _send_json(self, status_code, payload):
         self.send_response(status_code)
@@ -212,11 +205,13 @@ class handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
+    # 🔍 ব্রাউজারে ডোমেইন ওপেন করলেই ডেব্যাগের পুরো রিপোর্ট দেখাবে
     def do_GET(self):
         self._send_json(200, {
             "status": "online",
-            "service": "Garena Universal Deep-Scan Follow Engine v10.0",
-            "proto_loaded": follow_pb2 is not None
+            "proto_loaded": follow_pb2 is not None,
+            "load_error": LOAD_ERROR,
+            "server_files_detected": [f for f in ALL_FOUND_FILES if f.endswith(".py")]
         })
 
     def do_POST(self):
@@ -230,7 +225,6 @@ class handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"status": "failed", "message": "Target UID is required."})
                 return
 
-            # Batch Follow Mode
             if "tokens" in data and isinstance(data["tokens"], list):
                 tokens_list = data["tokens"]
 
@@ -277,7 +271,6 @@ class handler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # Single Follow Mode
             jwt_token = str(data.get('token', '')).strip()
             account_uid = str(data.get('uid', '')).strip()
             if not jwt_token:
