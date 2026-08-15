@@ -11,17 +11,26 @@ from Crypto.Util.Padding import pad
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Dynamic Pb2 Importer
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Pb2'))
+# Dynamic Multi-Path Importer for follow_pb2
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, CURRENT_DIR)
+sys.path.insert(0, os.path.join(CURRENT_DIR, '..'))
+sys.path.insert(0, os.path.join(CURRENT_DIR, '..', 'Pb2'))
+sys.path.insert(0, os.path.join(CURRENT_DIR, 'Pb2'))
+
+follow_pb2 = None
 try:
     import follow_pb2
-except ImportError:
-    pass
+except Exception:
+    try:
+        from . import follow_pb2
+    except Exception:
+        follow_pb2 = None
 
 STATIC_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 STATIC_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
 
-# High-Capacity Reusable Session Connection Pool (Ultra-Fast)
+# High-Capacity Reusable Session Connection Pool
 SESSION = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
 SESSION.mount('https://', adapter)
@@ -30,25 +39,71 @@ def encrypt_proto(payload_bytes: bytes) -> bytes:
     cipher = AES.new(STATIC_KEY, AES.MODE_CBC, STATIC_IV)
     return cipher.encrypt(pad(payload_bytes, AES.block_size))
 
+def encode_varint(n: int) -> bytes:
+    """Built-in pure python varint encoder (Zero-dependency fallback)"""
+    buf = bytearray()
+    while n > 127:
+        buf.append((n & 0x7F) | 0x80)
+        n >>= 7
+    buf.append(n & 0x7F)
+    return bytes(buf)
+
+def build_follow_payload(target_id: int) -> bytes:
+    """Build CSFollowReq payload with protobuf or pure fallback"""
+    if follow_pb2 is not None:
+        try:
+            req = follow_pb2.CSFollowReq()
+            req.target_id = int(target_id)
+            return encrypt_proto(req.SerializeToString())
+        except Exception:
+            pass
+    
+    # Pure-Python Raw Protobuf Payload for CSFollowReq (Field 1 = target_id)
+    raw_proto = b'\x08' + encode_varint(int(target_id))
+    return encrypt_proto(raw_proto)
+
+def parse_follow_response(content: bytes):
+    """Parse CSFollowRes using proto or raw byte scanner"""
+    fail_info = ""
+    remaining_play_count = 0
+    remaining_follow_capacity = -1
+
+    if follow_pb2 is not None:
+        try:
+            proto_res = follow_pb2.CSFollowRes()
+            proto_res.ParseFromString(content)
+            fail_info = str(proto_res.fail_info) if proto_res.fail_info else ""
+            remaining_play_count = getattr(proto_res, 'remaining_play_count', 0)
+            if hasattr(proto_res, 'remaining_follow_capacity'):
+                remaining_follow_capacity = proto_res.remaining_follow_capacity
+            return fail_info, remaining_play_count, remaining_follow_capacity
+        except Exception:
+            pass
+
+    # Fallback byte scanner for fail_info / already followed
+    try:
+        txt = content.decode('utf-8', errors='ignore').lower()
+        if "already" in txt or "followed" in txt:
+            fail_info = "already followed"
+    except Exception:
+        pass
+
+    return fail_info, remaining_play_count, remaining_follow_capacity
+
 def execute_single_follow(target_id: str, jwt_token: str, account_uid: str = ""):
-    """
-    BD এবং IND উভয় সার্ভার দিয়ে ফলো ট্রাই করবে এবং পুঙ্খানুপুঙ্খ রিপোর্ট দেবে
-    """
     urls = [
         "https://clientbp.ggpolarbear.com/Follow",        # BD Server
         "https://client.ind.freefiremobile.com/Follow"     # IND Server
     ]
 
     try:
-        req = follow_pb2.CSFollowReq()
-        req.target_id = int(target_id)
-        encrypted_data = encrypt_proto(req.SerializeToString())
+        encrypted_data = build_follow_payload(int(target_id))
     except Exception as e:
         return {
             "uid": account_uid,
             "status": "failed",
             "result_type": "FAILED",
-            "message": f"Proto encryption error: {str(e)}",
+            "message": f"Encryption error: {str(e)}",
             "should_save": False
         }
 
@@ -67,57 +122,56 @@ def execute_single_follow(target_id: str, jwt_token: str, account_uid: str = "")
         try:
             res = SESSION.post(url, headers=headers, data=encrypted_data, verify=False, timeout=6)
             if res.status_code == 200:
-                proto_res = follow_pb2.CSFollowRes()
-                proto_res.ParseFromString(res.content)
-                fail_txt = str(proto_res.fail_info).lower() if proto_res.fail_info else ""
+                fail_info, remaining_play_count, remaining_follow_capacity = parse_follow_response(res.content)
+                fail_txt = fail_info.lower()
 
-                # ১. অলরেডি ফলো দেওয়া থাকলে
+                # 1. Already Followed
                 if "already" in fail_txt or "followed" in fail_txt:
                     return {
                         "uid": account_uid,
                         "status": "already_followed",
                         "result_type": "ALREADY_FOLLOWED",
-                        "message": "Already Followed (অলরেডি ফলো দেওয়া ছিল)",
+                        "message": "Already Followed (অলরেডি দেওয়া ছিল)",
                         "should_save": True
                     }
 
-                # ২. ৩টি ম্যাচ খেলা না থাকলে
-                if proto_res.remaining_play_count > 0:
+                # 2. 3 Maps Play Needed
+                if remaining_play_count > 0:
                     return {
                         "uid": account_uid,
                         "status": "need_matches",
                         "result_type": "NEED_MATCHES",
-                        "remaining": proto_res.remaining_play_count,
-                        "message": f"Need 3 Maps Play ({proto_res.remaining_play_count} match remaining)",
+                        "remaining": remaining_play_count,
+                        "message": f"Need 3 Maps Play ({remaining_play_count} left)",
                         "should_save": False
                     }
 
-                # ৩. ডেলি ক্যাপাসিটি শেষ হলে
-                if hasattr(proto_res, 'remaining_follow_capacity') and proto_res.remaining_follow_capacity == 0:
+                # 3. Capacity Reached
+                if remaining_follow_capacity == 0:
                     return {
                         "uid": account_uid,
                         "status": "no_capacity",
                         "result_type": "NO_CAPACITY",
-                        "message": "Daily Capacity Reached (দৈনিক লিমিট শেষ)",
+                        "message": "Daily Capacity Reached",
                         "should_save": False
                     }
 
-                # ৪. অন্যান্য ফেইল্ড হলে
-                if proto_res.fail_info:
+                # 4. Other Failures
+                if fail_info:
                     return {
                         "uid": account_uid,
                         "status": "failed",
                         "result_type": "FAILED",
-                        "message": f"Failed: {proto_res.fail_info}",
+                        "message": f"Failed: {fail_info}",
                         "should_save": False
                     }
 
-                # ৫. সফলভাবে ফলো গেছে
+                # 5. Success
                 return {
                     "uid": account_uid,
                     "status": "success",
                     "result_type": "SUCCESS",
-                    "message": "Follow Sent Successfully (সফলভাবে ফলো গেছে)",
+                    "message": "Follow Sent Successfully",
                     "should_save": True
                 }
 
@@ -126,7 +180,7 @@ def execute_single_follow(target_id: str, jwt_token: str, account_uid: str = "")
                     "uid": account_uid,
                     "status": "token_expired",
                     "result_type": "TOKEN_EXPIRED",
-                    "message": "Token Expired / 401 (টোকেন মেয়াদোত্তীর্ণ)",
+                    "message": "Token Expired (401)",
                     "should_save": False
                 }
         except Exception:
@@ -136,7 +190,7 @@ def execute_single_follow(target_id: str, jwt_token: str, account_uid: str = "")
         "uid": account_uid,
         "status": "failed",
         "result_type": "FAILED",
-        "message": "Network/Server Timeout (সার্ভার রেসপন্স দেয়নি)",
+        "message": "Network/Server Timeout",
         "should_save": False
     }
 
@@ -158,7 +212,7 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        self._send_json(200, {"status": "online", "service": "Garena Turbo Follow Dispatcher v5.0 (Full Breakdown Reporting)"})
+        self._send_json(200, {"status": "online", "engine": "Turbo Follow Dispatcher v6.0 (Zero-Fail Engine)"})
 
     def do_POST(self):
         try:
@@ -167,12 +221,11 @@ class handler(BaseHTTPRequestHandler):
             data = json.loads(raw_body.decode('utf-8'))
 
             target_id = str(data.get('target_id', '')).strip()
-
             if not target_id:
                 self._send_json(400, {"status": "failed", "message": "Target UID required."})
                 return
 
-            # 🚀 আল্ট্রা ব্যাচ মোড: একসাথে ৬০+ টোকেন আসলে
+            # Batch Execution Mode
             if "tokens" in data and isinstance(data["tokens"], list):
                 tokens_list = data["tokens"]
                 
@@ -185,12 +238,10 @@ class handler(BaseHTTPRequestHandler):
                         acc_uid = ""
                     return execute_single_follow(target_id, tok, acc_uid)
 
-                # সর্বোচ্চ ৬০টি সমান্তরাল থ্রেডে একযোগে এক্সিকিউট হবে
                 workers_count = min(70, max(10, len(tokens_list)))
                 with ThreadPoolExecutor(max_workers=workers_count) as executor:
                     results = list(executor.map(worker, tokens_list))
 
-                # বিস্তারিত ক্যাটাগরি ভিত্তিক গণনা
                 success_c       = sum(1 for r in results if r.get("result_type") == "SUCCESS")
                 already_c       = sum(1 for r in results if r.get("result_type") == "ALREADY_FOLLOWED")
                 need_map_c      = sum(1 for r in results if r.get("result_type") == "NEED_MATCHES")
@@ -221,7 +272,7 @@ class handler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # একক টোকেনের রিকোয়েস্ট
+            # Single Execution Mode
             jwt_token = str(data.get('token', '')).strip()
             account_uid = str(data.get('uid', '')).strip()
 
