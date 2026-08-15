@@ -21,9 +21,11 @@ sys.path.insert(0, os.path.join(CURRENT_DIR, 'Pb2'))
 follow_pb2 = None
 try:
     import follow_pb2
+    from google.protobuf.json_format import MessageToDict
 except Exception:
     try:
         from . import follow_pb2
+        from google.protobuf.json_format import MessageToDict
     except Exception:
         follow_pb2 = None
 
@@ -40,7 +42,6 @@ def encrypt_proto(payload_bytes: bytes) -> bytes:
     return cipher.encrypt(pad(payload_bytes, AES.block_size))
 
 def encode_varint(n: int) -> bytes:
-    """Built-in pure python varint encoder (Zero-dependency fallback)"""
     buf = bytearray()
     while n > 127:
         buf.append((n & 0x7F) | 0x80)
@@ -49,7 +50,6 @@ def encode_varint(n: int) -> bytes:
     return bytes(buf)
 
 def build_follow_payload(target_id: int) -> bytes:
-    """Build CSFollowReq payload with protobuf or pure fallback"""
     if follow_pb2 is not None:
         try:
             req = follow_pb2.CSFollowReq()
@@ -57,38 +57,52 @@ def build_follow_payload(target_id: int) -> bytes:
             return encrypt_proto(req.SerializeToString())
         except Exception:
             pass
-    
-    # Pure-Python Raw Protobuf Payload for CSFollowReq (Field 1 = target_id)
     raw_proto = b'\x08' + encode_varint(int(target_id))
     return encrypt_proto(raw_proto)
 
-def parse_follow_response(content: bytes):
-    """Parse CSFollowRes using proto or raw byte scanner"""
-    fail_info = ""
-    remaining_play_count = 0
-    remaining_follow_capacity = -1
-
+def analyze_follow_result(content: bytes):
+    """
+    নিখুঁতভাবে যাচাই করবে ফলো আসলেই গেছে নাকি ম্যাচ বাকি বা ফেইল্ড
+    """
     if follow_pb2 is not None:
         try:
             proto_res = follow_pb2.CSFollowRes()
             proto_res.ParseFromString(content)
-            fail_info = str(proto_res.fail_info) if proto_res.fail_info else ""
-            remaining_play_count = getattr(proto_res, 'remaining_play_count', 0)
-            if hasattr(proto_res, 'remaining_follow_capacity'):
-                remaining_follow_capacity = proto_res.remaining_follow_capacity
-            return fail_info, remaining_play_count, remaining_follow_capacity
+            fail_txt = str(proto_res.fail_info).lower() if proto_res.fail_info else ""
+
+            # ১. অলরেডি ফলো দেওয়া থাকলে
+            if "already" in fail_txt or "followed" in fail_txt:
+                return "ALREADY_FOLLOWED", "Already Followed (অলরেডি ছিল)", True, 0
+
+            # ২. ৩টি ম্যাচ খেলা না থাকলে
+            if getattr(proto_res, 'remaining_play_count', 0) > 0:
+                rem = proto_res.remaining_play_count
+                return "NEED_MATCHES", f"Need 3 Maps Play ({rem} remaining)", False, rem
+
+            # ৩. ফলো লিমিট শেষ হলে
+            if hasattr(proto_res, 'remaining_follow_capacity') and proto_res.remaining_follow_capacity == 0:
+                return "NO_CAPACITY", "Daily Follow Capacity Reached", False, 0
+
+            # ৪. কোনো ফেইল ইনফো থাকলে
+            if proto_res.fail_info:
+                return "FAILED", f"Failed: {proto_res.fail_info}", False, 0
+
+            # ৫. নিশ্চিত ট্রু সাকসেস
+            return "SUCCESS", "Follow Sent Successfully", True, 0
+
         except Exception:
             pass
 
-    # Fallback byte scanner for fail_info / already followed
-    try:
-        txt = content.decode('utf-8', errors='ignore').lower()
-        if "already" in txt or "followed" in txt:
-            fail_info = "already followed"
-    except Exception:
-        pass
+    # Fallback RAW scanner
+    txt = content.decode('utf-8', errors='ignore').lower()
+    if "already" in txt or "followed" in txt:
+        return "ALREADY_FOLLOWED", "Already Followed (অলরেডি ছিল)", True, 0
+    
+    # যদি কন্টেন্ট ছোট বা খালি থাকে তবে এটি ফেইল্ড (ফেক সাকসেস বন্ধ করতে)
+    if len(content) < 2:
+        return "FAILED", "Invalid server response", False, 0
 
-    return fail_info, remaining_play_count, remaining_follow_capacity
+    return "SUCCESS", "Follow Sent Successfully", True, 0
 
 def execute_single_follow(target_id: str, jwt_token: str, account_uid: str = ""):
     urls = [
@@ -122,59 +136,15 @@ def execute_single_follow(target_id: str, jwt_token: str, account_uid: str = "")
         try:
             res = SESSION.post(url, headers=headers, data=encrypted_data, verify=False, timeout=6)
             if res.status_code == 200:
-                fail_info, remaining_play_count, remaining_follow_capacity = parse_follow_response(res.content)
-                fail_txt = fail_info.lower()
-
-                # 1. Already Followed
-                if "already" in fail_txt or "followed" in fail_txt:
-                    return {
-                        "uid": account_uid,
-                        "status": "already_followed",
-                        "result_type": "ALREADY_FOLLOWED",
-                        "message": "Already Followed (অলরেডি দেওয়া ছিল)",
-                        "should_save": True
-                    }
-
-                # 2. 3 Maps Play Needed
-                if remaining_play_count > 0:
-                    return {
-                        "uid": account_uid,
-                        "status": "need_matches",
-                        "result_type": "NEED_MATCHES",
-                        "remaining": remaining_play_count,
-                        "message": f"Need 3 Maps Play ({remaining_play_count} left)",
-                        "should_save": False
-                    }
-
-                # 3. Capacity Reached
-                if remaining_follow_capacity == 0:
-                    return {
-                        "uid": account_uid,
-                        "status": "no_capacity",
-                        "result_type": "NO_CAPACITY",
-                        "message": "Daily Capacity Reached",
-                        "should_save": False
-                    }
-
-                # 4. Other Failures
-                if fail_info:
-                    return {
-                        "uid": account_uid,
-                        "status": "failed",
-                        "result_type": "FAILED",
-                        "message": f"Failed: {fail_info}",
-                        "should_save": False
-                    }
-
-                # 5. Success
+                res_type, msg, should_save, rem_maps = analyze_follow_result(res.content)
                 return {
                     "uid": account_uid,
-                    "status": "success",
-                    "result_type": "SUCCESS",
-                    "message": "Follow Sent Successfully",
-                    "should_save": True
+                    "status": res_type.lower(),
+                    "result_type": res_type,
+                    "remaining": rem_maps,
+                    "message": msg,
+                    "should_save": should_save
                 }
-
             elif res.status_code == 401:
                 return {
                     "uid": account_uid,
@@ -212,7 +182,7 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        self._send_json(200, {"status": "online", "engine": "Turbo Follow Dispatcher v6.0 (Zero-Fail Engine)"})
+        self._send_json(200, {"status": "online", "service": "Garena Turbo Follow Engine v7.0 (Strict Accurate Mode)"})
 
     def do_POST(self):
         try:
