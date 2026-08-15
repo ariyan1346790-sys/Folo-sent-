@@ -3,6 +3,7 @@ import sys
 import json
 import urllib3
 import requests
+import importlib.util
 from http.server import BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from Crypto.Cipher import AES
@@ -11,21 +12,62 @@ from Crypto.Util.Padding import pad
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Dynamic Multi-Path Protobuf Importer
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, CURRENT_DIR)
-sys.path.insert(0, os.path.join(CURRENT_DIR, '..'))
-sys.path.insert(0, os.path.join(CURRENT_DIR, 'Pb2'))
-sys.path.insert(0, os.path.join(CURRENT_DIR, '..', 'Pb2'))
+# ==============================================================================
+#      🔍 UNIVERSAL DEEP SCANNER (যে ফোল্ডারেই থাকুক খুঁজে লোড করবে)
+# ==============================================================================
+follow_pb2 = None
 
-try:
-    import follow_pb2
-except ImportError:
-    follow_pb2 = None
+def find_and_load_follow_pb2():
+    global follow_pb2
+    # ১. সরাসরি সাধারণ ইমপোর্ট ট্রাই
+    try:
+        import follow_pb2 as pb
+        follow_pb2 = pb
+        return
+    except Exception:
+        pass
 
+    # ২. বর্তমান ডিরেক্টরি এবং তার ওপরের/ভেতরের সব সাব-ফোল্ডার স্ক্যান
+    base_dirs = [
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')),
+        os.getcwd(),
+        "/var/task"  # Vercel AWS Lambda Root
+    ]
+
+    scanned_paths = set()
+    for b_dir in base_dirs:
+        if not os.path.exists(b_dir):
+            continue
+        for root, dirs, files in os.walk(b_dir):
+            if root in scanned_paths:
+                continue
+            scanned_paths.add(root)
+            if root not in sys.path:
+                sys.path.insert(0, root)
+
+            for f in files:
+                if f.lower() == "follow_pb2.py" or (f.lower().endswith(".py") and "follow_pb2" in f.lower()):
+                    full_file_path = os.path.join(root, f)
+                    try:
+                        spec = importlib.util.spec_from_file_location("follow_pb2", full_file_path)
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        if hasattr(mod, 'CSFollowReq') and hasattr(mod, 'CSFollowRes'):
+                            follow_pb2 = mod
+                            return
+                    except Exception:
+                        pass
+
+find_and_load_follow_pb2()
+
+# ==============================================================================
+#                       OFFICIAL GARENA CRYPTO & KEYS
+# ==============================================================================
 STATIC_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 STATIC_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
 
+# High-Capacity Reusable Session Connection Pool
 SESSION = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=1)
 SESSION.mount('https://', adapter)
@@ -34,17 +76,21 @@ def encrypt_proto(payload_bytes: bytes) -> bytes:
     cipher = AES.new(STATIC_KEY, AES.MODE_CBC, STATIC_IV)
     return cipher.encrypt(pad(payload_bytes, AES.block_size))
 
+# ==============================================================================
+#                   FOLLOW REQUEST RUNNER (BD + IND SERVERS)
+# ==============================================================================
 def send_follow_request(target_id, jwt_token):
-    """
-    spin.py এর মতো BD এবং IND উভয় সার্ভারে ফলো পাঠানোর ট্রাই করবে
-    """
+    global follow_pb2
+    if follow_pb2 is None:
+        find_and_load_follow_pb2()
+
+    if follow_pb2 is None:
+        return False, None, "follow_pb2 file could not be loaded anywhere on server"
+
     urls = [
         "https://clientbp.ggpolarbear.com/Follow",        # BD Server
         "https://client.ind.freefiremobile.com/Follow"     # IND Server
     ]
-
-    if follow_pb2 is None:
-        return False, None, "follow_pb2 module missing on server"
 
     try:
         req = follow_pb2.CSFollowReq()
@@ -79,10 +125,10 @@ def send_follow_request(target_id, jwt_token):
 
     return False, None, "HTTP Server Error or Timeout"
 
+# ==============================================================================
+#                     SPIN.PY EXACT RESPONSE JUDGEMENT
+# ==============================================================================
 def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
-    """
-    spin.py এর হুবহু লজিক অনুযায়ী রেজাল্ট জাজ করবে
-    """
     ok, proto_res, err_msg = send_follow_request(target_id, jwt_token)
     if not ok:
         res_type = "TOKEN_EXPIRED" if "401" in err_msg else "FAILED"
@@ -106,7 +152,7 @@ def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
             "should_save": True
         }
 
-    # Check 2: Fail Info from server (❌ NOT Saved - কোনো এরর থাকলে কখনোই সাকসেস হবে না)
+    # Check 2: Fail Info from server (❌ NOT Saved)
     if proto_res.fail_info:
         return {
             "uid": uid,
@@ -146,6 +192,9 @@ def process_single_follow(target_id: str, jwt_token: str, uid: str = ""):
         "should_save": True
     }
 
+# ==============================================================================
+#                            SERVERLESS HANDLER
+# ==============================================================================
 class handler(BaseHTTPRequestHandler):
     def _send_json(self, status_code, payload):
         self.send_response(status_code)
@@ -164,7 +213,11 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        self._send_json(200, {"status": "online", "service": "Garena Accurate Follow Engine v8.0"})
+        self._send_json(200, {
+            "status": "online",
+            "service": "Garena Universal Deep-Scan Follow Engine v10.0",
+            "proto_loaded": follow_pb2 is not None
+        })
 
     def do_POST(self):
         try:
